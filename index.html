@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document Summarizer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.23.4/full/pyodide.js"></script>
+</head>
+<body class="bg-gray-100 flex flex-col items-center justify-center min-h-screen p-4">
+    <div class="bg-white p-6 rounded-lg shadow-lg w-full max-w-2xl">
+        <h1 class="text-2xl font-bold mb-4 text-center">Document Summarizer</h1>
+        <p class="text-gray-600 mb-4 text-center">Upload a Word (.docx) or PDF (.pdf) document to generate a study summary.</p>
+        <input type="file" id="fileInput" accept=".docx,.pdf" class="mb-4 w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100">
+        <button id="summarizeBtn" class="w-full bg-blue-500 text-white py-2 px-4 rounded hover:bg-blue-600 disabled:bg-gray-400" disabled>Generate Summary</button>
+        <div id="loading" class="hidden mt-4 text-center text-gray-600">Loading Pyodide and processing...</div>
+        <div id="output" class="mt-4 p-4 bg-gray-50 rounded hidden prose max-w-none"></div>
+        <div id="error" class="mt-4 p-4 bg-red-50 text-red-700 rounded hidden"></div>
+    </div>
+
+    <script>
+        let pyodide;
+        const fileInput = document.getElementById('fileInput');
+        const summarizeBtn = document.getElementById('summarizeBtn');
+        const loading = document.getElementById('loading');
+        const output = document.getElementById('output');
+        const error = document.getElementById('error');
+
+        async function loadPyodideAndPackages() {
+            loading.classList.remove('hidden');
+            error.classList.add('hidden');
+            try {
+                pyodide = await loadPyodide();
+                await pyodide.loadPackage(['micropip']);
+                const micropip = pyodide.pyimport('micropip');
+                await micropip.install([
+                    'python-docx',
+                    'PyPDF2',
+                    'nltk'
+                ]);
+                await pyodide.runPythonAsync(`
+import nltk
+import os
+import time
+global use_fallback
+use_fallback = False
+nltk.data.path.append('/home/pyodide/nltk_data')
+os.makedirs('/home/pyodide/nltk_data', exist_ok=True)
+for attempt in range(3):
+    try:
+        nltk.download('punkt', download_dir='/home/pyodide/nltk_data', quiet=True)
+        nltk.download('stopwords', download_dir='/home/pyodide/nltk_data', quiet=True)
+        from nltk.tokenize import sent_tokenize
+        from nltk.corpus import stopwords
+        sent_tokenize("Test sentence.")
+        stopwords.words('english')
+        break
+    except Exception as e:
+        if attempt == 2:
+            global use_fallback
+            use_fallback = True
+            break
+        time.sleep(1)
+                `);
+            } catch (err) {
+                throw new Error(`Failed to load Pyodide or packages: ${err.message}`);
+            }
+            loading.classList.add('hidden');
+            summarizeBtn.disabled = false;
+        }
+
+        async function initializePythonCode() {
+            await pyodide.runPythonAsync(`
+import docx
+import PyPDF2
+from collections import Counter
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import sent_tokenize, word_tokenize
+import io
+import js
+import re
+
+global use_fallback
+use_fallback = False
+
+def clean_text(text):
+    text = ''.join(c for c in text if c.isprintable() or c.isspace())
+    text = re.sub(r'\\s+', ' ', text).strip()
+    text = re.sub(r'\\b(?:http\\S+|\\w+/\\w+|\\S+\\.\\S+)\\b', '', text)
+    return text
+
+def clean_title(title):
+    title = re.sub(r'^(Microsoft Word -|Chapter \\d+|Ch \\d+|\\d+\\s)', '', title, flags=re.IGNORECASE).strip()
+    title = re.sub(r'\\.docx$', '', title, flags=re.IGNORECASE).strip()
+    return title if title else "Untitled Document"
+
+def extract_title(text, doc_type, file_content, file_name):
+    title_source = "filename"
+    title = file_name
+    if doc_type == 'docx':
+        try:
+            doc = docx.Document(io.BytesIO(file_content))
+            for para in doc.paragraphs:
+                if para.text.strip() and para.style.name.startswith('Heading'):
+                    title = para.text.strip()
+                    title_source = "heading"
+                    break
+                elif para.text.strip() and title_source == "filename":
+                    title = para.text.strip()
+                    title_source = "first_paragraph"
+            title = clean_title(title)
+        except:
+            title = clean_title(file_name)
+    elif doc_type == 'pdf':
+        try:
+            reader = PyPDF2.PdfReader(io.BytesIO(file_content))
+            if reader.metadata and reader.metadata.get('/Title'):
+                title = reader.metadata['/Title']
+                title_source = "metadata"
+            elif text.split('\\n')[0].strip():
+                title = text.split('\\n')[0].strip()
+                title_source = "first_line"
+            title = clean_title(title)
+        except:
+            title = clean_title(file_name)
+    js.console.log(f"Extracted title: {title} (source: {title_source})")
+    return title
+
+def infer_purpose(text):
+    text_lower = text.lower()
+    if any(word in text_lower for word in ['sdlc', 'development life cycle', 'software development']):
+        return "This document explains the Systems Development Life Cycle (SDLC) process for software project management."
+    elif any(word in text_lower for word in ['guide', 'tutorial', 'how to', 'setup', 'configure']):
+        return "This document provides a step-by-step guide or tutorial for a technical process."
+    elif any(word in text_lower for word in ['study', 'research', 'analysis']):
+        return "This document presents an academic study or research analysis."
+    return "This document provides information or instructions."
+
+def infer_subject(text, title):
+    text_lower = text.lower()
+    title_lower = title.lower()
+    if 'sdlc' in text_lower or 'development life cycle' in text_lower or 'sdlc' in title_lower:
+        return "Systems Development Life Cycle (SDLC)"
+    elif 'software' in text_lower or 'software' in title_lower:
+        return "Software Development"
+    return "Document Subject"
+
+def fallback_sent_tokenize(text):
+    sentences = re.split(r'(?<=[.!?])\\s+', text)
+    return [s.strip() for s in sentences if s.strip() and len(s) > 10 and not s.lower().startswith(('click', 'press', 'select', 'create', 'change'))]
+
+def extract_text_from_docx(file_content):
+    try:
+        doc = docx.Document(io.BytesIO(file_content))
+        text = ' '.join([para.text for para in doc.paragraphs if para.text.strip()])
+        return clean_text(text)
+    except Exception as e:
+        return f"Error extracting text from .docx: {str(e)}"
+
+def extract_text_from_pdf(file_content):
+    try:
+        reader = PyPDF2.PdfReader(io.BytesIO(file_content))
+        text = ''
+        for page in reader.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted
+        return clean_text(text)
+    except Exception as e:
+        return f"Error extracting text from .pdf: {str(e)}"
+
+def extract_text(file_name, file_content):
+    js.console.log("Executing extract_text function")
+    doc_type = 'docx' if file_name.endswith('.docx') else 'pdf'
+    text = extract_text_from_docx(file_content) if doc_type == 'docx' else extract_text_from_pdf(file_content)
+    if text.startswith("Error"):
+        return text, "No title found", "Unknown purpose", "Unknown subject"
+    if len(text.split()) < 20:
+        return "Error: Extracted text is too short or invalid.", "No title found", "Unknown purpose", "Unknown subject"
+    title = extract_title(text, doc_type, file_content, file_name)
+    purpose = infer_purpose(text)
+    subject = infer_subject(text, title)
+    return text, title, purpose, subject
+
+def summarize_text(text):
+    global use_fallback
+    js.console.log("Extracted text preview:", text[:200])
+    if use_fallback:
+        sentences = fallback_sent_tokenize(text)
+    else:
+        try:
+            sentences = sent_tokenize(text)
+        except:
+            sentences = fallback_sent_tokenize(text)
+            use_fallback = True
+    if len(sentences) < 2:
+        sentences = fallback_sent_tokenize(text)
+        if len(sentences) < 2:
+            return "Error: Not enough valid sentences to summarize."
+        return ' '.join(sentences[:min(3, len(sentences))])
+    try:
+        stop_words = set(stopwords.words('english'))
+    except:
+        stop_words = set(['a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'you', 'your', 'this', 'that', 'click', 'press', 'create', 'select', 'change', 'would', 'should', 'could', 'they', 'their'])
+    words = word_tokenize(text.lower()) if not use_fallback else re.findall(r'\\b\\w+\\b', text.lower())
+    words = [w for w in words if w.isalnum() and w not in stop_words and len(w) > 3]
+    word_freq = Counter(words)
+    if not word_freq:
+        return "Error: No meaningful words found for summarization."
+    content_keywords = ['sdlc', 'development', 'software', 'phase', 'implementation', 'planning', 'project', 'data', 'center', 'traffic', 'management', 'design', 'analysis']
+    sentence_scores = {}
+    for sent in sentences:
+        sent_words = [w.lower() for w in (word_tokenize(sent) if not use_fallback else re.findall(r'\\b\\w+\\b', sent)) if w.isalnum()]
+        score = sum(word_freq.get(word, 0) for word in sent_words)
+        if any(keyword in sent.lower() for keyword in content_keywords):
+            score *= 1.5
+        sentence_scores[sent] = score / (len(sent_words) + 1)
+    num_sentences = min(3, len(sentences))
+    summary_sentences = sorted(sentence_scores, key=sentence_scores.get, reverse=True)[:num_sentences]
+    summary_words = ' '.join(summary_sentences).lower().split()
+    if (len(set(summary_words)) < 10):
+        return ' '.join(sentences[:min(3, len(sentences))])
+    summary_sentences = [sent for sent in sentences if sent in summary_sentences]
+    return ' '.join(summary_sentences)
+
+def extract_key_points(text, num_points=5):
+    global use_fallback
+    if use_fallback:
+        sentences = fallback_sent_tokenize(text)
+    else:
+        try:
+            sentences = sent_tokenize(text)
+        except:
+            sentences = fallback_sent_tokenize(text)
+            use_fallback = True
+    if len(sentences) < 2:
+        return ["Error: Not enough sentences for key points."]
+    try:
+        stop_words = set(stopwords.words('english'))
+    except:
+        stop_words = set(['a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'you', 'your', 'this', 'that', 'click', 'press', 'create', 'select', 'change', 'would', 'should', 'could', 'they', 'their'])
+    words = word_tokenize(text.lower()) if not use_fallback else re.findall(r'\\b\\w+\\b', text.lower())
+    words = [w for w in words if w.isalnum() and w not in stop_words and len(w) > 3]
+    word_freq = Counter(words)
+    content_keywords = ['sdlc', 'development', 'software', 'phase', 'implementation', 'planning', 'project', 'data', 'center', 'traffic', 'management', 'design', 'analysis']
+    sentence_scores = {}
+    for sent in sentences:
+        sent_words = [w.lower() for w in (word_tokenize(sent) if not use_fallback else re.findall(r'\\b\\w+\\b', sent)) if w.isalnum()]
+        score = sum(word_freq.get(word, 0) for word in sent_words)
+        if any(keyword in sent.lower() for keyword in content_keywords):
+            score *= 1.5
+        sentence_scores[sent] = score / (len(sent_words) + 1)
+    key_sentences = sorted(sentence_scores, key=sentence_scores.get, reverse=True)[:num_points]
+    return [sent.strip() for sent in key_sentences if sent.strip()] or ["No key points identified."]
+
+def suggest_further_topics(text, subject, num_topics=3):
+    global use_fallback
+    try:
+        stop_words = set(stopwords.words('english'))
+    except:
+        stop_words = set(['a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'you', 'your', 'this', 'that', 'click', 'press', 'create', 'select', 'change', 'would', 'should', 'could', 'they', 'their'])
+    words = word_tokenize(text.lower()) if not use_fallback else re.findall(r'\\b\\w+\\b', text.lower())
+    words = [w for w in words if w.isalnum() and w not in stop_words and len(w) > 3 and w not in ['click', 'create', 'press', 'select', 'change', 'would', 'they', 'their']]
+    word_freq = Counter(words)
+    content_keywords = ['sdlc', 'development', 'software', 'phase', 'implementation', 'planning', 'project', 'data', 'center', 'traffic', 'management', 'design', 'analysis']
+    common_words = [word for word, count in word_freq.most_common(10) if (word in content_keywords or count > 1) and word not in ['would', 'should', 'could', 'they', 'their']]
+    topics = []
+    for word in common_words[:num_topics]:
+        topics.append(f"Explore {word.capitalize()} in the context of {subject}")
+    return topics or [f"No specific topics identified for {subject}."]
+
+def generate_study_summary(file_name, file_content, title, purpose, subject):
+    try:
+        text = extract_text_from_docx(file_content) if file_name.endswith('.docx') else extract_text_from_pdf(file_content)
+        if text.startswith("Error"):
+            return text
+        main_message = summarize_text(text)
+        key_points = extract_key_points(text)
+        further_topics = suggest_further_topics(text, subject)
+        summary = f"# Study Summary\\n\\n"
+        summary += "## Title\\n"
+        summary += f"{title}\\n\\n"
+        summary += "## Purpose\\n"
+        summary += f"{purpose}\\n\\n"
+        summary += "## Main Message\\n"
+        summary += f"{main_message}\\n\\n"
+        summary += "## Key Points\\n"
+        for i, point in enumerate(key_points, 1):
+            summary += f"- {point}\\n"
+        summary += "\\n## Topics for Further Study\\n"
+        for i, topic in enumerate(further_topics, 1):
+            summary += f"- {topic}\\n"
+        return summary
+    except Exception as e:
+        return f"Error generating summary: {str(e)}"
+            `);
+        }
+
+        fileInput.addEventListener('change', () => {
+            summarizeBtn.disabled = !fileInput.files.length;
+            output.classList.add('hidden');
+            error.classList.add('hidden');
+        });
+
+        summarizeBtn.addEventListener('click', async () => {
+            output.classList.add('hidden');
+            error.classList.add('hidden');
+            loading.classList.remove('hidden');
+
+            const file = fileInput.files[0];
+            if (!file) {
+                error.textContent = "Please select a file.";
+                error.classList.remove('hidden');
+                loading.classList.add('hidden');
+                return;
+            }
+
+            let arrayBuffer;
+            try {
+                arrayBuffer = await file.arrayBuffer();
+            } catch (err) {
+                error.textContent = "Failed to read file.";
+                error.classList.remove('hidden');
+                loading.classList.add('hidden');
+                return;
+            }
+
+            try {
+                if (!pyodide.globals.get('generate_study_summary')) {
+                    await initializePythonCode();
+                }
+
+                // Convert to Python bytes before passing to Python
+                const fileContent = new Uint8Array(arrayBuffer);
+                const pyBytes = pyodide.toPy(fileContent);
+                pyodide.globals.set('file_content', pyBytes);
+                pyodide.globals.set('file_name', file.name);
+
+                const result = await pyodide.runPythonAsync(`
+text, title, purpose, subject = extract_text(file_name, file_content)
+(text, title, purpose, subject)
+                `);
+
+                const [text, title, purpose, subject] = result.toJs ? result.toJs() : result;
+
+                if (text.startsWith("Error")) {
+                    throw new Error(text);
+                }
+
+                const summary = await pyodide.runPythonAsync(`
+generate_study_summary(file_name, file_content, title, purpose, subject)
+                `);
+
+                // --- Enhanced formatting below ---
+                function parseSummary(summary) {
+                    const sections = {};
+                    let current = '';
+                    summary.split('\n').forEach(line => {
+                        if (line.startsWith('## ')) {
+                            current = line.replace('## ', '').trim();
+                            sections[current] = [];
+                        } else if (line.startsWith('- ')) {
+                            if (current) sections[current].push(line);
+                        } else if (line && current) {
+                            if (sections[current].length === 0) {
+                                sections[current] = [line];
+                            } else {
+                                sections[current][sections[current].length - 1] += ' ' + line;
+                            }
+                        }
+                    });
+                    return {
+                        title: (sections['Title'] || [''])[0],
+                        purpose: (sections['Purpose'] || [''])[0],
+                        mainMessage: (sections['Main Message'] || [''])[0],
+                        keyPoints: sections['Key Points'] || [],
+                        topics: sections['Topics for Further Study'] || []
+                    };
+                }
+
+                const parsed = parseSummary(summary);
+
+                output.innerHTML = `
+                    <div class="bg-white rounded-lg shadow p-6">
+                        <h1 class="text-3xl font-bold text-blue-700 mb-6 text-center border-b pb-2">Study Summary</h1>
+                        <div class="mb-6">
+                            <h2 class="text-xl font-semibold text-gray-800 mb-1">Title</h2>
+                            <div class="text-lg text-gray-700 mb-2">${parsed.title}</div>
+                        </div>
+                        <div class="mb-6">
+                            <h2 class="text-xl font-semibold text-gray-800 mb-1">Purpose</h2>
+                            <div class="text-gray-700 mb-2">${parsed.purpose}</div>
+                        </div>
+                        <div class="mb-6">
+                            <h2 class="text-xl font-semibold text-gray-800 mb-1">Main Message</h2>
+                            <div class="text-gray-700 mb-2">${parsed.mainMessage}</div>
+                        </div>
+                        <div class="mb-6">
+                            <h2 class="text-xl font-semibold text-gray-800 mb-1">Key Points</h2>
+                            <ul class="list-disc ml-8 text-gray-700">
+                                ${parsed.keyPoints.map(point => `<li class="mb-1">${point.replace(/^- /, '')}</li>`).join('')}
+                            </ul>
+                        </div>
+                        <div>
+                            <h2 class="text-xl font-semibold text-gray-800 mb-1">Topics for Further Study</h2>
+                            <ul class="list-disc ml-8 text-gray-700">
+                                ${parsed.topics.map(topic => `<li class="mb-1">${topic.replace(/^- /, '')}</li>`).join('')}
+                            </ul>
+                        </div>
+                    </div>
+                `;
+                output.classList.remove('hidden');
+            } catch (err) {
+                loading.classList.add('hidden');
+                error.textContent = `Processing error: ${err.message}`;
+                error.classList.remove('hidden');
+            } finally {
+                try { pyodide.globals.delete('file_content'); } catch {}
+                try { pyodide.globals.delete('file_name'); } catch {}
+                loading.classList.add('hidden');
+            }
+        });
+
+        window.addEventListener('DOMContentLoaded', loadPyodideAndPackages);
+    </script>
+</body>
+</html>
